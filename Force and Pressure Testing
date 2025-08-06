@@ -1,0 +1,344 @@
+/*!
+ * Combined NAU7802 Force Scale and MPRLS Pressure Sensor
+ * Reads both sensors simultaneously with timestamps
+ * 
+ * Hardware Required:
+ * - NAU7802 Load Cell Amplifier
+ * - MPRLS Pressure Sensor
+ * Both use I2C communication
+ */
+
+#include <Wire.h>
+#include <Adafruit_NAU7802.h>
+#include "Adafruit_MPRLS.h"
+
+// NAU7802 Force sensor setup
+Adafruit_NAU7802 nau;
+
+// MPRLS Pressure sensor setup
+#define RESET_PIN  -1  // set to any GPIO pin # to hard-reset on begin()
+#define EOC_PIN    -1  // set to any GPIO pin to read end-of-conversion by pin
+Adafruit_MPRLS mpr = Adafruit_MPRLS(RESET_PIN, EOC_PIN);
+
+// Calibration variables for force sensor
+float calibrationFactor = 1.0;  // Scale factor to convert raw readings to force units (Newtons)
+int32_t zeroOffset = 0;         // Zero offset (tare value)
+bool isCalibrated = false;
+
+// Calibration variables for pressure sensor
+float pressureOffset = 0;       // Atmospheric pressure offset for gauge pressure
+bool isPressureCalibrated = false;
+
+// Timing variables
+unsigned long startTime = 0;
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Combined NAU7802 Force Scale and MPRLS Pressure Sensor");
+  Serial.println("=====================================================");
+  
+  // Initialize NAU7802 Force Sensor
+  Serial.println("Initializing NAU7802 Force Sensor...");
+  if (!nau.begin()) {
+    Serial.println("Failed to find NAU7802");
+    while (1) delay(10);
+  }
+  Serial.println("Found NAU7802");
+
+  // Configure NAU7802
+  nau.setLDO(NAU7802_3V0);
+  Serial.print("LDO voltage set to ");
+  switch (nau.getLDO()) {
+    case NAU7802_4V5:  Serial.println("4.5V"); break;
+    case NAU7802_4V2:  Serial.println("4.2V"); break;
+    case NAU7802_3V9:  Serial.println("3.9V"); break;
+    case NAU7802_3V6:  Serial.println("3.6V"); break;
+    case NAU7802_3V3:  Serial.println("3.3V"); break;
+    case NAU7802_3V0:  Serial.println("3.0V"); break;
+    case NAU7802_2V7:  Serial.println("2.7V"); break;
+    case NAU7802_2V4:  Serial.println("2.4V"); break;
+    case NAU7802_EXTERNAL:  Serial.println("External"); break;
+  }
+
+  nau.setGain(NAU7802_GAIN_128);
+  Serial.print("Gain set to ");
+  switch (nau.getGain()) {
+    case NAU7802_GAIN_1:  Serial.println("1x"); break;
+    case NAU7802_GAIN_2:  Serial.println("2x"); break;
+    case NAU7802_GAIN_4:  Serial.println("4x"); break;
+    case NAU7802_GAIN_8:  Serial.println("8x"); break;
+    case NAU7802_GAIN_16:  Serial.println("16x"); break;
+    case NAU7802_GAIN_32:  Serial.println("32x"); break;
+    case NAU7802_GAIN_64:  Serial.println("64x"); break;
+    case NAU7802_GAIN_128:  Serial.println("128x"); break;
+  }
+
+  nau.setRate(NAU7802_RATE_10SPS);
+  Serial.print("Conversion rate set to ");
+  switch (nau.getRate()) {
+    case NAU7802_RATE_10SPS:  Serial.println("10 SPS"); break;
+    case NAU7802_RATE_20SPS:  Serial.println("20 SPS"); break;
+    case NAU7802_RATE_40SPS:  Serial.println("40 SPS"); break;
+    case NAU7802_RATE_80SPS:  Serial.println("80 SPS"); break;
+    case NAU7802_RATE_320SPS:  Serial.println("320 SPS"); break;
+  }
+
+  // Take 10 readings to flush out readings
+  for (uint8_t i = 0; i < 10; i++) {
+    while (!nau.available()) delay(1);
+    nau.read();
+  }
+
+  // Calibrate NAU7802
+  while (!nau.calibrate(NAU7802_CALMOD_INTERNAL)) {
+    Serial.println("Failed to calibrate internal offset, retrying!");
+    delay(1000);
+  }
+  Serial.println("Calibrated internal offset");
+
+  while (!nau.calibrate(NAU7802_CALMOD_OFFSET)) {
+    Serial.println("Failed to calibrate system offset, retrying!");
+    delay(1000);
+  }
+  Serial.println("Calibrated system offset");
+
+  // Initialize MPRLS Pressure Sensor
+  Serial.println("\nInitializing MPRLS Pressure Sensor...");
+  if (!mpr.begin()) {
+    Serial.println("Failed to communicate with MPRLS sensor, check wiring?");
+    while (1) {
+      delay(10);
+    }
+  }
+  Serial.println("Found MPRLS sensor");
+
+  // Display commands
+  Serial.println("\n=== Calibration Commands ===");
+  Serial.println("'t' - Tare (zero) the force scale");
+  Serial.println("'c' - Calibrate force scale with known weight");
+  Serial.println("'r' - Reset force calibration");
+  Serial.println("'p' - Calibrate pressure to atmospheric (set gauge zero)");
+  Serial.println("'z' - Reset pressure calibration");
+  Serial.println("'s' - Start/restart timestamp");
+  Serial.println("\n=== Data Output Format ===");
+  Serial.println("Time(ms), Force(N), Gauge Pressure(PSI)");
+  Serial.println("=======================================");
+  
+  // Initialize start time
+  startTime = millis();
+}
+
+void loop() {
+  // Check for serial commands
+  if (Serial.available()) {
+    char command = Serial.read();
+    switch (command) {
+      case 't':
+      case 'T':
+        tareScale();
+        break;
+      case 'c':
+      case 'C':
+        calibrateWithKnownWeight();
+        break;
+      case 'r':
+      case 'R':
+        resetCalibration();
+        break;
+      case 'p':
+      case 'P':
+        calibratePressureToAtmospheric();
+        break;
+      case 'z':
+      case 'Z':
+        resetPressureCalibration();
+        break;
+      case 's':
+      case 'S':
+        startTime = millis();
+        Serial.println("Timestamp reset to 0");
+        break;
+    }
+  }
+  
+  // Get current timestamp
+  unsigned long currentTime = millis() - startTime;
+  
+  // Read force sensor
+  int32_t rawValue = 0;
+  float force = 0;
+  if (nau.available()) {
+    rawValue = nau.read();
+    if (isCalibrated) {
+      force = getForce(rawValue);
+    }
+  }
+  
+  // Read pressure sensor
+  float pressure_hPa = mpr.readPressure();
+  float pressure_PSI = pressure_hPa / 68.947572932;
+  
+  // Calculate gauge pressure if calibrated
+  float gaugePressure_PSI = pressure_PSI;
+  if (isPressureCalibrated) {
+    gaugePressure_PSI = pressure_PSI - pressureOffset;
+  }
+  
+  // Print data with timestamp
+  Serial.print(currentTime);
+  Serial.print(", ");
+  
+  if (isCalibrated) {
+    Serial.print(force, 4);
+  } else {
+    Serial.print("NC"); // Not Calibrated
+  }
+  Serial.print(", ");
+  Serial.println(gaugePressure_PSI, 4);
+  
+  delay(500);  // Update every 500ms
+}
+
+// Function to get average reading over multiple samples
+int32_t getAverageReading(int samples = 10) {
+  long sum = 0;
+  for (int i = 0; i < samples; i++) {
+    while (!nau.available()) delay(1);
+    sum += nau.read();
+  }
+  return sum / samples;
+}
+
+// Function to tare (zero) the scale
+void tareScale() {
+  Serial.println("Taring scale... Remove all weight and press Enter");
+  while (Serial.available()) Serial.read(); // Clear buffer
+  while (!Serial.available()) delay(10);   // Wait for Enter
+  while (Serial.available()) Serial.read(); // Clear buffer
+  
+  Serial.println("Measuring zero point...");
+  zeroOffset = getAverageReading(20);
+  Serial.print("Tare complete. Zero offset: ");
+  Serial.println(zeroOffset);
+}
+
+// Function to calibrate with a known weight
+void calibrateWithKnownWeight() {
+  Serial.println("=== Force Scale Calibration ===");
+  
+  // Step 1: Tare the scale
+  Serial.println("Step 1: Remove all weight from scale and press Enter");
+  while (Serial.available()) Serial.read(); // Clear buffer
+  while (!Serial.available()) delay(10);   // Wait for Enter
+  while (Serial.available()) Serial.read(); // Clear buffer
+  
+  Serial.println("Measuring zero point...");
+  zeroOffset = getAverageReading(20);
+  Serial.print("Zero point set: ");
+  Serial.println(zeroOffset);
+  
+  // Step 2: Get known force value
+  Serial.println("\nStep 2: Enter the force of your calibration object in Newtons:");
+  Serial.println("(e.g., 0.9807 for ~100g object, 4.9033 for ~500g object)");
+  Serial.println("Tip: Force (N) = Mass (kg) × 9.80665");
+  
+  float knownForce = 0;
+  while (knownForce <= 0) {
+    while (!Serial.available()) delay(10);
+    String input = Serial.readString();
+    input.trim();
+    knownForce = input.toFloat();
+    
+    if (knownForce <= 0) {
+      Serial.println("Please enter a valid positive force in Newtons:");
+    }
+  }
+  
+  Serial.print("Calibration force: ");
+  Serial.print(knownForce, 4);
+  Serial.println(" Newtons");
+  
+  // Step 3: Measure with known force
+  Serial.println("\nStep 3: Place the calibration object on the scale and press Enter");
+  while (Serial.available()) Serial.read(); // Clear buffer
+  while (!Serial.available()) delay(10);   // Wait for Enter
+  while (Serial.available()) Serial.read(); // Clear buffer
+  
+  Serial.println("Measuring with calibration object...");
+  int32_t weightedReading = getAverageReading(20);
+  
+  // Calculate calibration factor
+  int32_t rawForceDifference = weightedReading - zeroOffset;
+  
+  if (rawForceDifference == 0) {
+    Serial.println("Error: No force detected. Calibration failed.");
+    return;
+  }
+  
+  calibrationFactor = knownForce / (float)rawForceDifference;
+  isCalibrated = true;
+  
+  Serial.println("\n=== Calibration Complete ===");
+  Serial.print("Zero offset: ");
+  Serial.println(zeroOffset);
+  Serial.print("Raw reading with object: ");
+  Serial.println(weightedReading);
+  Serial.print("Raw difference: ");
+  Serial.println(rawForceDifference);
+  Serial.print("Calibration factor: ");
+  Serial.println(calibrationFactor, 8);
+  Serial.println("Scale is now calibrated for force measurement!");
+  Serial.println("Remove the calibration object to begin normal operation.\n");
+}
+
+// Function to convert raw reading to force
+float getForce(int32_t rawReading) {
+  return (rawReading - zeroOffset) * calibrationFactor;
+}
+
+// Function to reset calibration
+void resetCalibration() {
+  calibrationFactor = 1.0;
+  zeroOffset = 0;
+  isCalibrated = false;
+  Serial.println("Force calibration reset. Use 'c' command to recalibrate.");
+}
+
+// Function to calibrate pressure to atmospheric (set gauge pressure zero)
+void calibratePressureToAtmospheric() {
+  Serial.println("=== Pressure Gauge Calibration ===");
+  Serial.println("Ensure sensor is exposed to atmospheric pressure");
+  Serial.println("Press Enter to calibrate atmospheric pressure as zero gauge pressure");
+  
+  while (Serial.available()) Serial.read(); // Clear buffer
+  while (!Serial.available()) delay(10);   // Wait for Enter
+  while (Serial.available()) Serial.read(); // Clear buffer
+  
+  Serial.println("Measuring atmospheric pressure...");
+  
+  // Take multiple readings for accuracy
+  float totalPressure = 0;
+  int samples = 10;
+  for (int i = 0; i < samples; i++) {
+    float pressure_hPa = mpr.readPressure();
+    totalPressure += pressure_hPa / 68.947572932; // Convert to PSI
+    delay(100);
+  }
+  
+  pressureOffset = totalPressure / samples;
+  isPressureCalibrated = true;
+  
+  Serial.println("\n=== Pressure Calibration Complete ===");
+  Serial.print("Atmospheric pressure offset: ");
+  Serial.print(pressureOffset, 4);
+  Serial.println(" PSI");
+  Serial.println("Gauge pressure calibration complete!");
+  Serial.println("Pressure readings will now show gauge pressure (relative to atmosphere)\n");
+}
+
+// Function to reset pressure calibration
+void resetPressureCalibration() {
+  pressureOffset = 0;
+  isPressureCalibrated = false;
+  Serial.println("Pressure calibration reset. Use 'p' command to recalibrate gauge pressure.");
+}
